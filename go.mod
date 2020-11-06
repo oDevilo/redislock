@@ -1,4 +1,4 @@
-module cmdb
+module redislock
 
 go 1.15
 
