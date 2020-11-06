@@ -1,0 +1,28 @@
+# Binaries for programs and plugins
+*.exe
+*.dll
+*.so
+*.dylib
+
+# test binary, build with `go test -c`
+*.test
+
+# Output of the go coverage tool, specifically when used with LiteIDE
+*.out
+
+# Project-local glide cache, RE: https://github.com/Masterminds/glide/issues/736
+.glide/
+
+# Gogland directory
+/.idea/
+
+# Output of project
+.DS_Store
+config.yaml
+*.db
+request.token
+*.log
+/log/
+/vendor/*
+!/vendor/vendor.json
+dockerfile
