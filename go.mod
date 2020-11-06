@@ -1,4 +1,4 @@
-module redislock
+module github.com/oDevilo/redislock
 
 go 1.15
 
