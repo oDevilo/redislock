@@ -6,133 +6,170 @@ import (
 	"log"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
 var subConn *redis.PubSubConn
 var subConnMutex sync.Mutex
-var lockId = uuid.NewV4().String()
-var nameChannel sync.Map
+var lockId = uuid.NewV4().String() // 每个机器一个就行
+var renewMap sync.Map              // 进行renwe的锁 key 锁名 value gid
+var lockEntryMap sync.Map
+
+type Entry struct {
+	waitCount int32
+	channel   chan bool
+}
 
 // 可重入锁 起码需要3个连接 一个用于请求 一个用于renew 一个用于订阅
 type ReentrantLock struct {
-	name        string // 锁定的key
-	lockId      string // 生成的uuid 相当于机器号
-	pool        *redis.Pool
-	renew       bool
-	waitChannel chan bool // 等待数
-	leaseTime   int64
+	name      string // 锁定的key
+	pool      *redis.Pool
+	leaseTime int64
 }
 
 func NewReentrantLock(pool *redis.Pool, name string, leaseTime int64) *ReentrantLock {
 	// 为每个name 创建其监听
 	lock := &ReentrantLock{
-		name:        name,
-		pool:        pool,
-		lockId:      lockId,
-		renew:       false,
-		waitChannel: make(chan bool),
-		leaseTime:   leaseTime,
+		name:      name,
+		pool:      pool,
+		leaseTime: leaseTime,
 	}
 	// 获取订阅连接
 	if subConn == nil {
 		subConnMutex.Lock()
-		if subConn == nil {
+		if subConn == nil { // 双重检测
 			subConn = &redis.PubSubConn{Conn: pool.Get()}
 			go func() {
 				for {
 					switch res := subConn.Receive().(type) {
 					case redis.Message:
 						keyName := string(res.Data)
-						channel, _ := nameChannel.Load(keyName)
-						if channel == nil {
-							log.Println(keyName + " 不存在")
-							continue
+						if load, ok := lockEntryMap.Load(keyName); ok {
+							entry := load.(*Entry)
+							entry.channel <- true
 						}
-						channel.(chan bool) <- true
 					}
 				}
 			}()
 		}
 		subConnMutex.Unlock()
 	}
-	if err := subConn.Subscribe(lock.getChannelName()); err != nil { // todo 已经不用的锁 需要取消订阅 否则订阅越来越多会对redis造成影响
-		log.Println("订阅失败 ", err)
-	}
-	nameChannel.Store(name, make(chan bool))
 	return lock
 }
 
 // 获取不到锁会一直等待
 func (l *ReentrantLock) Lock() error {
-	ttl, err := l.tryAcquire()
-	if err != nil {
+	if locked, err := l.TryLock(); err != nil {
 		return err
-	}
-	if ttl == 0 {
-		l.renewLock(l.getGLockId())
+	} else if locked {
 		return nil
 	}
 
+	// 失败的 去订阅通道 等释放锁的通知
+	if err := l.subscribe(); err != nil {
+		return err
+	}
+
+	if err := l.waitLock(); err != nil {
+		return err
+	} else {
+		l.unsubscribe()
+		return nil
+	}
+}
+
+func (l *ReentrantLock) waitLock() error {
 	for {
-		// 等待者 + 1
-		l.waitChannel <- true
-
-		channel, _ := nameChannel.Load(l.name)
-		<-channel.(chan bool)
-		ttl, err := l.tryAcquire()
-		if err != nil {
+		if locked, err := l.TryLock(); err != nil {
 			return err
-		}
-
-		if ttl == 0 {
-			//l.waitCount--
-			l.renewLock(l.getGLockId())
+		} else if locked {
 			return nil
 		}
+		load, _ := lockEntryMap.Load(l.name)
+		entry := load.(*Entry)
+		<-entry.channel
+	}
+}
+
+func (l *ReentrantLock) subscribe() error {
+	if load, ok := lockEntryMap.Load(l.name); ok {
+		entry := load.(*Entry)
+		atomic.AddInt32(&entry.waitCount, 1)
+		entry.channel <- true
+		return nil
+	}
+
+	entry := Entry{waitCount: 0, channel: make(chan bool, 10)}
+
+	if load, ok := lockEntryMap.LoadOrStore(l.name, &entry); ok {
+		entry := load.(*Entry)
+		atomic.AddInt32(&entry.waitCount, 1)
+		entry.channel <- true
+		return nil
+	} else {
+		if err := subConn.Subscribe(l.getChannelName()); err != nil {
+			log.Println("订阅失败 ", err)
+			return err
+		}
+		return nil
+	}
+}
+
+func (l *ReentrantLock) unsubscribe() {
+	load, _ := lockEntryMap.Load(l.name)
+	entry := load.(*Entry)
+	if atomic.LoadInt32(&entry.waitCount) == 0 {
+		lockEntryMap.Delete(l.name)
+		if err := subConn.Unsubscribe(l.getChannelName()); err != nil {
+			log.Println("取消订阅失败 ", err)
+		}
+	} else {
+		entry.channel <- true
 	}
 }
 
 // 直接返回成功失败 leaseTime 单位 毫秒
 func (l *ReentrantLock) TryLock() (bool, error) {
-	ttl, err := l.tryAcquire()
-	if err != nil {
+	if ttl, err := l.tryAcquire(); err != nil {
 		return false, err
+	} else if ttl == 0 {
+		return true, nil
 	}
-	if ttl == 0 {
-		l.renewLock(l.getGLockId())
-		return true, err
-	} else {
-		return false, err
-	}
+	return false, nil
 }
 
-// 定时任务 刷新 如果等待为空
-func (l *ReentrantLock) renewLock(gid string) {
-	if l.renew { // 已经有更新任务启动了
+// 定时任务 只有获取到分布式锁的才会进入这个方法 刷新 name和gid对应的过期时间
+func (l *ReentrantLock) renewLockStart(gid string) {
+	if _, ok := renewMap.Load(l.name); ok {
 		return
 	}
-	l.renew = true // 可以进入这步的表示获取到锁了 而且只有当前协程主动unlock才会改为false 所以没有并发问题
+
+	timer := time.NewTimer(time.Duration(l.leaseTime/3) * time.Millisecond)
 
 	go func() {
-		conn := l.pool.Get()
-		defer func() {
-			returnConn(conn)
-		}()
-		for {
-			// 等待的时候 有别的获取到锁了
-			time.Sleep(time.Duration(l.leaseTime/3) * time.Millisecond)
+		select {
+		case <-timer.C:
+			conn := l.pool.Get()
+			renewMap.LoadAndDelete(l.name)
 			result, err := reentrantRenewScript.Do(conn, l.name, l.leaseTime, gid)
 			if err != nil {
 				log.Println(err)
 				return // 怕日志太多 直接返回
 			}
-			if result.(int64) != 1 { // todo 如果还有等待的 则继续跑 如果没有等待了 更新状态
-				l.renew = false
-				return
+			if err = returnConn(conn); err != nil {
+				log.Println(err)
+				return // 怕日志太多 直接返回
+			}
+			if result.(int64) == 1 { // 更新成功 重新执行
+				l.renewLockStart(gid)
 			}
 		}
 	}()
+
+	if _, loaded := renewMap.LoadOrStore(l.name, gid); loaded {
+		timer.Stop()
+	}
 
 }
 
@@ -159,6 +196,7 @@ func (l *ReentrantLock) tryAcquire() (int, error) {
 		if ttl != nil {
 			return int(ttl.(int64)), err
 		} else {
+			l.renewLockStart(l.getGLockId())
 			return 0, err
 		}
 	}
@@ -179,7 +217,7 @@ var reentrantLockScript = redis.NewScript(1, `
 `)
 
 func (l *ReentrantLock) getGLockId() string {
-	return l.lockId + ":" + strconv.FormatUint(GetGID(), 10)
+	return lockId + ":" + strconv.FormatUint(GetGID(), 10)
 }
 
 func (l *ReentrantLock) Unlock() error {

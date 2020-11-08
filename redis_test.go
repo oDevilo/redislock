@@ -5,6 +5,7 @@ import (
 	"github.com/gomodule/redigo/redis"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -42,14 +43,33 @@ func TestConcurrent(t *testing.T) {
 	var wg = &sync.WaitGroup{}
 	start()
 
-	lock := NewReentrantLock(pool, "test", 6000)
+	lock := NewReentrantLock(pool, "AAAAA", 6000)
 
-	for i := 0; i < 1; i++ {
+	for i := 0; i < 10; i++ {
 		wg.Add(1)
 		go func() {
 			doSomething(lock, wg)
 		}()
 	}
+
+	lock2 := NewReentrantLock(pool, "BBBBB", 3000)
+
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func() {
+			doSomething(lock2, wg)
+		}()
+	}
+
+	lock3 := NewReentrantLock(pool, "CCCCC", 3000)
+
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func() {
+			doSomething(lock3, wg)
+		}()
+	}
+
 	wg.Wait()
 }
 
@@ -60,76 +80,17 @@ func doSomething(lock *ReentrantLock, wg *sync.WaitGroup) {
 		if err != nil {
 			fmt.Println(err)
 		}
-		fmt.Println(strconv.FormatUint(gid, 10) + " 获取到锁")
+		fmt.Println(strconv.FormatUint(gid, 10) + " 获取到锁 " + lock.name)
 	}
 
 	for i := 0; i < 5; i++ {
 		if err := lock.Unlock(); err != nil {
 			fmt.Println(err)
 		} else {
-			fmt.Println(strconv.FormatUint(gid, 10) + " 释放锁")
+			fmt.Println(strconv.FormatUint(gid, 10) + " 释放锁 " + lock.name)
 		}
 	}
-	fmt.Println(pool.IdleCount())
 	wg.Done()
-}
-
-func TestPubsub(t *testing.T) {
-	start()
-
-	conn := pool.Get()
-	t.Log(&conn)
-
-	subConn := redis.PubSubConn{conn}
-	if err := subConn.Subscribe("tt"); err != nil {
-		t.Log(err)
-		return
-	}
-
-	if err := subConn.Subscribe("xx"); err != nil {
-		t.Log(err)
-		return
-	}
-
-	go func() {
-		for i := 0; i < 5; i++ {
-			switch res := subConn.Receive().(type) {
-			case redis.Message:
-				fmt.Println(res.Channel, string(res.Data))
-			case redis.Subscription:
-				fmt.Printf("%s: %s %d\n", res.Channel, res.Kind, res.Count)
-			case error:
-				fmt.Println(res)
-			}
-			fmt.Println(i)
-		}
-		//if err := subConn.Unsubscribe("tt"); err != nil {
-		//	t.Log(err)
-		//	return
-		//}
-
-		subConn.Close()
-
-		//conn = pool.Get()
-		//t.Log(&conn)
-		//
-		//conn.Send("SET", "name", "red")
-		//conn.Send("SET", "t2", "red")
-		//conn.Send("SET", "name", "red")
-		//conn.Send("SET", "name", "red")
-		//conn.Flush()
-
-		fmt.Println(1111)
-	}()
-
-	if err := subConn.Subscribe("tt"); err != nil {
-		t.Log(err)
-		return
-	}
-
-	fmt.Println("do")
-
-	<-make(chan bool)
 }
 
 func TestBaseLock(t *testing.T) {
@@ -164,4 +125,106 @@ func doSomethingBase(lock *BaseLock, wg *sync.WaitGroup) {
 	fmt.Println(pool.IdleCount())
 	wg.Done()
 
+}
+
+func TestChannel(t *testing.T) {
+	ch := make(chan bool)
+	go func() {
+		ch <- true
+		fmt.Println("do", time.Now())
+	}()
+
+	go func() {
+		fmt.Println("1 ", <-ch)
+	}()
+
+	go func() {
+		fmt.Println("2 ", <-ch)
+	}()
+
+	go func() {
+		time.Sleep(time.Second)
+		ch <- true
+		fmt.Println("do", time.Now())
+	}()
+
+	<-make(chan bool)
+}
+
+var wg sync.WaitGroup
+
+func TestWaitGroup(t *testing.T) { // 可以重复使用
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func() {
+			wg.Done()
+		}()
+	}
+	wg.Wait()
+
+	fmt.Println("first wait")
+
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func() {
+			wg.Done()
+		}()
+	}
+	wg.Wait()
+
+	fmt.Println("second wait")
+}
+
+func TestWaitGroup2(t *testing.T) { //
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func() {
+			wg.Done()
+		}()
+	}
+	wg.Wait()
+
+	for i := 0; i < 2; i++ {
+		go func(a int) {
+			wg.Wait()
+			t.Log(a)
+		}(i)
+	}
+	<-make(chan bool)
+}
+
+func TestAtomic(t *testing.T) {
+	renwe := int32(0)
+	fmt.Println(atomic.CompareAndSwapInt32(&renwe, 0, 0))
+	fmt.Println(atomic.LoadInt32(&renwe))
+	fmt.Println(atomic.CompareAndSwapInt32(&renwe, 0, 1))
+	fmt.Println(atomic.LoadInt32(&renwe))
+	fmt.Println(atomic.CompareAndSwapInt32(&renwe, 1, 0))
+	fmt.Println(atomic.LoadInt32(&renwe))
+}
+
+var mutex sync.Mutex
+
+func TestMutex(t *testing.T) {
+	mutex.Lock()
+
+	time.Sleep(time.Second)
+
+	go func() {
+		mutex.Unlock()
+		fmt.Println(111)
+		fmt.Println(111)
+		fmt.Println(111)
+		fmt.Println(111)
+	}()
+
+	go func() {
+		mutex.Lock()
+		fmt.Println(222)
+		fmt.Println(222)
+		fmt.Println(222)
+		fmt.Println(222)
+	}()
+
+	<-make(chan bool)
 }
