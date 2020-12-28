@@ -202,6 +202,7 @@ func (l *ReentrantLock) tryAcquire() (int, error) {
 	}
 }
 
+// keys[1] name argv[1] leaseTime argv[2] id
 var reentrantLockScript = redis.NewScript(1, `
 	if (redis.call('exists', KEYS[1]) == 0) then 
 		redis.call('hset', KEYS[1], ARGV[2], 1)
